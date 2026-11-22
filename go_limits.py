@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fetch OpenCode Go's published prices and compare the previous snapshot."""
+"""Fetch OpenCode Go's published prices and allowances and compare the previous snapshot."""
 import json
 import os
 import re
@@ -11,117 +11,161 @@ from html.parser import HTMLParser
 from pathlib import Path
 from urllib.request import Request, urlopen
 
-URL = 'https://opencode.ai/v2/docs/console/go'
+DOCS_URL = 'https://opencode.ai/docs/console/go.md'
+CONSOLE_URL = 'https://opencode.ai/console/go'
 CATALOG_URL = 'https://models.dev/api.json'
 STATE = Path(os.environ.get('XDG_STATE_HOME', str(Path.home() / '.local/state'))) / 'opencode-go/last.json'
+# Bump when snapshot rows stop being comparable; older snapshots then restart as a baseline.
+SOURCE_FORMAT = 2
+PLANS = {'go': 'go', 'go-plus': 'go_plus'}
+AGENT = {'User-Agent': 'opencode-go-limits/2.0'}
 
 
-class Table(HTMLParser):
+def ratios(markdown):
+    """Read the 5-hour and weekly shares of the monthly allowance from the Go docs."""
+    found = {}
+    for key, label in (('five_hour', '5-hour'), ('weekly', 'weekly')):
+        match = re.search(label + r' limit\W*is (\d+(?:\.\d+)?)% of (?:your|the) monthly allowance', markdown, re.I)
+        if not match:
+            raise ValueError(f'Allowance formula missing or changed: {label} limit')
+        found[key] = Decimal(match[1]) / 100
+    if not all(0 < share <= 1 for share in found.values()):
+        raise ValueError(f'Implausible allowance formula: {found}')
+    return found
+
+
+def amount(text):
+    """Parse a console allowance cell: '$15', '$1.50', '392', '1.2K', or '∞' (unlimited -> None)."""
+    text = text.strip()
+    if text == '∞':
+        return None
+    match = re.fullmatch(r'(\$)?(\d[\d,]*(?:\.\d+)?)([KM])?', text)
+    if not match:
+        raise ValueError(f'Unrecognized allowance: {text!r}')
+    value = Decimal(match[2].replace(',', '')) * {None: 1, 'K': 1000, 'M': 1000000}[match[3]]
+    return float(value) if match[1] else int(value)
+
+
+class Allowances(HTMLParser):
+    """Collect rows of the console's 'Go and Go Plus allowances' table."""
+
     def __init__(self):
         super().__init__()
-        self.active = False
-        self.done = False
         self.rows = []
         self.row = None
-        self.cell = None
-        self.skip = 0
+        self.capture = None
+        self.kind = None
+        self.plan = None
 
     def handle_starttag(self, tag, attrs):
-        if dict(attrs).get('id') == 'go-pricing-panel-go':
-            self.active = True
-        if not self.active or self.done:
+        attrs = dict(attrs)
+        if tag == 'tr' and attrs.get('data-layer') == 'model-row':
+            self.row = {'id': attrs.get('data-model'), 'name': '', 'note': '', 'values': {}}
+        if self.row is None:
             return
-        if tag in ('del', 's'):
-            self.skip += 1
-        if tag == 'tr':
-            self.row = []
-        if tag in ('td', 'th'):
-            self.cell = ''
-        if tag == 'br' and self.cell is not None:
-            self.cell += ' '
+        layer = attrs.get('data-layer')
+        if tag == 'td' and 'data-allowance-type' in attrs:
+            self.kind = attrs['data-allowance-type']
+        if layer == 'allowance':
+            self.plan = attrs.get('data-plan')
+        if layer in ('model-name', 'model-note'):
+            self.capture = 'name' if layer == 'model-name' else 'note'
+        if layer == 'current-value':
+            self.capture = 'value'
+            self.row['values'][(self.kind, self.plan)] = ''
 
     def handle_data(self, data):
-        if self.cell is not None and not self.skip:
-            self.cell += data
+        if self.row is None or self.capture is None:
+            return
+        if self.capture == 'value':
+            self.row['values'][(self.kind, self.plan)] += data
+        else:
+            self.row[self.capture] += data
 
     def handle_endtag(self, tag):
-        if not self.active or self.done:
+        if self.row is None:
             return
-        if tag in ('del', 's'):
-            self.skip -= 1
-        if tag in ('td', 'th') and self.cell is not None:
-            self.row.append(' '.join(self.cell.split()))
-            self.cell = None
-        if tag == 'tr' and self.row is not None:
+        if tag == 'span':
+            self.capture = None
+        if tag == 'td':
+            self.kind = None
+        if tag == 'tr':
             self.rows.append(self.row)
             self.row = None
-        if tag == 'table':
-            self.done = True
 
 
-def money(value):
-    if value == '-':
-        return None
-    if value == 'Free':
-        return 0
-    if not re.fullmatch(r'\$\d+(?:\.\d+)?', value):
-        raise ValueError(f'Unrecognized price: {value!r}')
-    return float(Decimal(value[1:]))
-
-
-def parse(html):
-    # Fail closed if the documented allowance formula changes.
-    plain = re.sub('<[^>]+>', ' ', html)
-    if not re.search(r'5-hour\s*—\s*20%.*?weekly\s*—\s*50%.*?monthly\s*—\s*100%', plain, re.S):
-        raise ValueError('Allowance formula missing or changed')
-    parser = Table()
+def parse_console(html):
+    parser = Allowances()
     parser.feed(html)
-    expected = ['Model', 'Input', 'Output', 'Cached Read', 'Cached Write', 'Monthly limit']
-    if not parser.done or not parser.rows or parser.rows[0] != expected or len(parser.rows) < 2:
-        raise ValueError('Go table missing, incomplete, or changed')
-    models = {}
-    for row in parser.rows[1:]:
-        if len(row) != 6 or not row[0] or row[0] in models:
-            raise ValueError('Malformed or duplicate model row')
-        label, *prices, limit = row
-        match = re.fullmatch(r'(\$\d+(?:\.\d+)?|Unlimited)(?:\s+(.*))?', limit)
-        if not match:
-            raise ValueError(f'Unrecognized limit: {limit!r}')
-        monthly = None if match[1] == 'Unlimited' else money(match[1])
-        models[label] = {
-            'prices_usd_per_million_tokens': dict(zip(['input', 'output', 'cached_read', 'cached_write'], map(money, prices))),
-            'limits_usd': {'monthly': monthly, 'weekly': None if monthly is None else float(Decimal(str(monthly)) * Decimal('.5')), 'five_hour': None if monthly is None else float(Decimal(str(monthly)) * Decimal('.2'))},
-            'unlimited': monthly is None,
-            'limit_note': match[2],
+    if not parser.rows:
+        raise ValueError('Go allowance table missing or changed')
+    rows = {}
+    for row in parser.rows:
+        name = ' '.join(row['name'].split())
+        if not row['id'] or not name or row['id'] in rows:
+            raise ValueError(f'Malformed or duplicate allowance row: {row["id"]!r}')
+        expected = {(kind, plan) for kind in ('requests', 'usage') for plan in PLANS}
+        if set(row['values']) != expected:
+            raise ValueError(f'Allowance columns changed for {name}: {sorted(map(str, row["values"]))}')
+        rows[row['id']] = {
+            'label': name,
+            'note': ' '.join(row['note'].split()) or None,
+            'monthly': {PLANS[plan]: amount(row['values'][('usage', plan)]) for plan in PLANS},
+            'requests': {PLANS[plan]: amount(row['values'][('requests', plan)]) for plan in PLANS},
         }
-    return dict(sorted(models.items(), key=lambda item: (not (
-        item[1]['prices_usd_per_million_tokens']['input'] == 0
-        and item[1]['prices_usd_per_million_tokens']['output'] == 0
-    ), -float('inf') if item[1]['unlimited'] else -item[1]['limits_usd']['monthly'])))
+    return rows
 
 
-def add_model_keys(models, catalog):
-    def normalized(name):
-        return re.sub(r'[^a-z0-9]', '', re.sub(r'\s*\([^)]*\)', '', name).lower())
+def limits(monthly, share):
+    if monthly is None:
+        return {'monthly': None, 'weekly': None, 'five_hour': None}
+    base = Decimal(str(monthly))
+    return {'monthly': monthly, 'weekly': float(base * share['weekly']), 'five_hour': float(base * share['five_hour'])}
 
-    for label, row in models.items():
-        providers = ['opencode', 'opencode-go'] if row['prices_usd_per_million_tokens']['input'] == 0 and row['prices_usd_per_million_tokens']['output'] == 0 else ['opencode-go']
-        for provider in providers:
-            matches = [key for key, model in catalog[provider]['models'].items()
-                       if normalized(label) in (normalized(key), normalized(model['name']))]
-            if len(matches) > 1:
-                raise ValueError(f'Ambiguous model key: {label}')
-            if matches:
-                row['model_key'] = f'{provider}/{matches[0]}'
-                break
-        else:
-            raise ValueError(f'No catalog model key for: {label}')
+
+def prices(cost):
+    return {'input': cost.get('input'), 'output': cost.get('output'),
+            'cached_read': cost.get('cache_read'), 'cached_write': cost.get('cache_write')}
+
+
+def build(console, share, catalog):
+    go_models = catalog['opencode-go']['models']
+    zen_models = catalog.get('opencode', {}).get('models', {})
+    models = {}
+    for model_id, row in console.items():
+        entry = go_models.get(model_id)
+        cost = (entry or {}).get('cost')
+        price = prices(cost) if cost else dict.fromkeys(['input', 'output', 'cached_read', 'cached_write'])
+        free = price['input'] == 0 and price['output'] == 0
+        provider = 'opencode' if free and model_id in zen_models else 'opencode-go'
+        if row['label'] in models:
+            raise ValueError(f'Duplicate model label: {row["label"]}')
+        models[row['label']] = {
+            'model_key': f'{provider}/{model_id}',
+            'prices_usd_per_million_tokens': price,
+            'price_tiers': [{'above_context_tokens': tier['tier']['size'], **prices(tier)}
+                            for tier in (cost or {}).get('tiers', []) if tier.get('tier', {}).get('type') == 'context'],
+            'price_note': None if cost else 'Not in Models.dev opencode-go catalog; prices unknown',
+            'limits_usd': limits(row['monthly']['go'], share),
+            'limits_usd_by_plan': {plan: limits(row['monthly'][plan], share) for plan in PLANS.values()},
+            'est_requests_per_5h': row['requests'],
+            'unlimited': row['monthly']['go'] is None,
+            'limit_note': row['note'],
+        }
+    return dict(sorted(models.items(), key=lambda item: (
+        not (item[1]['prices_usd_per_million_tokens']['input'] == 0 and item[1]['prices_usd_per_million_tokens']['output'] == 0),
+        -float('inf') if item[1]['unlimited'] else -item[1]['limits_usd']['monthly'])))
 
 
 def changes(old, new):
     if old is None:
         return {'baseline': True, 'added': [], 'removed': [], 'changed': {}}
     return {'baseline': False, 'added': sorted(new.keys() - old.keys()), 'removed': sorted(old.keys() - new.keys()), 'changed': {k: {'before': old[k], 'after': new[k]} for k in sorted(old.keys() & new.keys()) if old[k] != new[k]}}
+
+
+def fetch(url):
+    with urlopen(Request(url, headers=AGENT), timeout=30) as response:
+        return response.read().decode('utf-8')
 
 
 def main():
@@ -133,12 +177,20 @@ def main():
         with (STATE.parent / 'lock').open('w') as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
             previous = json.loads(STATE.read_text()) if STATE.exists() else None
-            request = Request(URL, headers={'User-Agent': 'opencode-go-limits/1.0'})
-            with urlopen(request, timeout=30) as response:
-                models = parse(response.read().decode('utf-8'))
-            with urlopen(Request(CATALOG_URL, headers={'User-Agent': 'opencode-go-limits/1.0'}), timeout=30) as response:
-                add_model_keys(models, json.load(response))
-            result = {'model_key_source_url': CATALOG_URL, 'ok': True, 'schema_version': 1, 'plan': 'Go', 'source_url': URL + '#usage-limits', 'fetched_at': datetime.now(timezone.utc).isoformat(), 'derived_limits': ['weekly', 'five_hour'], 'models': models, 'changes': changes(None if previous is None else previous['models'], models)}
+            if previous is not None and previous.get('source_format') != SOURCE_FORMAT:
+                previous = None
+            share = ratios(fetch(DOCS_URL))
+            models = build(parse_console(fetch(CONSOLE_URL)), share, json.loads(fetch(CATALOG_URL)))
+            result = {
+                'ok': True, 'schema_version': 1, 'source_format': SOURCE_FORMAT, 'plan': 'Go', 'plans': list(PLANS.values()),
+                'source_url': CONSOLE_URL + '#limits', 'formula_source_url': DOCS_URL,
+                'price_source_url': CATALOG_URL, 'model_key_source_url': CATALOG_URL,
+                'fetched_at': datetime.now(timezone.utc).isoformat(),
+                'derived_limits': ['weekly', 'five_hour'],
+                'derived_ratios': {key: float(value) for key, value in share.items()},
+                'models': models,
+                'changes': changes(None if previous is None else previous['models'], models),
+            }
             encoded = json.dumps(result, indent=2, ensure_ascii=False) + '\n'
             with tempfile.NamedTemporaryFile(mode='w', dir=STATE.parent, delete=False) as handle:
                 temporary = Path(handle.name)
