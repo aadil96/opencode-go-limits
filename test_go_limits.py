@@ -61,7 +61,10 @@ class Checks(unittest.TestCase):
     def test_reject_invalid_console(self):
         missing_plan = page(row('kimi-k3', 'Kimi K3', ('98', '392'), ('$15', '$60'))).replace('data-plan="go-plus"', 'data-plan="go-max"')
         duplicate = page(row('kimi-k3', 'Kimi K3', ('1', '2'), ('$1', '$2')), row('kimi-k3', 'Kimi K3', ('1', '2'), ('$1', '$2')))
-        for html in ['<table></table>', missing_plan, duplicate, page(row('', 'No id', ('1', '2'), ('$1', '$2')))]:
+        full = page(row('kimi-k3', 'Kimi K3', ('98', '392'), ('$15', '$60')), row('grok-4.7', 'Grok 4.7', ('169', '676'), ('$15', '$60')))
+        before_second_row = full[:full.index('<tr data-model="grok-4.7"')]
+        mid_second_row = full[:full.index('data-allowance-type="usage"', full.index('grok-4.7'))]
+        for html in ['<table></table>', missing_plan, duplicate, page(row('', 'No id', ('1', '2'), ('$1', '$2'))), before_second_row, mid_second_row]:
             with self.assertRaises(ValueError):
                 parse_console(html)
 

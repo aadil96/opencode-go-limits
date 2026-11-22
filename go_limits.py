@@ -56,6 +56,7 @@ class Allowances(HTMLParser):
         self.capture = None
         self.kind = None
         self.plan = None
+        self.closed = False
 
     def handle_starttag(self, tag, attrs):
         attrs = dict(attrs)
@@ -83,6 +84,8 @@ class Allowances(HTMLParser):
             self.row[self.capture] += data
 
     def handle_endtag(self, tag):
+        if tag == 'table' and self.rows:
+            self.closed = True
         if self.row is None:
             return
         if tag == 'span':
@@ -97,8 +100,12 @@ class Allowances(HTMLParser):
 def parse_console(html):
     parser = Allowances()
     parser.feed(html)
+    parser.close()
     if not parser.rows:
         raise ValueError('Go allowance table missing or changed')
+    # A truncated page must not pass as a table with fewer models.
+    if parser.row is not None or not parser.closed:
+        raise ValueError('Go allowance table incomplete')
     rows = {}
     for row in parser.rows:
         name = ' '.join(row['name'].split())
